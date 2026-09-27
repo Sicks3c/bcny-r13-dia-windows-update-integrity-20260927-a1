@@ -126,7 +126,8 @@ function Test-FullBlockMap([string]$PackagePath) {
           }
           if ($offset -ne $wanted) { $errors.Add("short:${entryName}:${blockCount}:$offset/$wanted"); break }
           $full.AppendData($buffer, 0, $offset)
-          $actual = [Convert]::ToBase64String([Security.Cryptography.SHA256]::HashData($buffer))
+          $blockHasher = [Security.Cryptography.SHA256]::Create()
+          try { $actual = [Convert]::ToBase64String($blockHasher.ComputeHash($buffer)) } finally { $blockHasher.Dispose() }
           if ($actual -ne $block.Hash) { $errors.Add("block:${entryName}:${blockCount}") }
           $remaining -= $wanted
         }
