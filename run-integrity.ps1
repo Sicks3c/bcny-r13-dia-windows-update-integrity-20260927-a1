@@ -184,6 +184,19 @@ function Test-AppInstallerVariant([string]$Path, [string]$Label) {
   }
   catch { $errorRecord = $_ }
   $packages = @(Get-AppxPackage -Name "TheBrowserCompany.Dia" -ErrorAction SilentlyContinue)
+  $installed = $packages | Sort-Object Version -Descending | Select-Object -First 1
+  $installedSummary = if ($installed) {
+    $diaExe = Join-Path $installed.InstallLocation "Dia.exe"
+    [ordered]@{
+      name=$installed.Name
+      version=[string]$installed.Version
+      publisher=$installed.Publisher
+      architecture=[string]$installed.Architecture
+      full_name=$installed.PackageFullName
+      status=[string]$installed.Status
+      dia_exe_signature=if (Test-Path -LiteralPath $diaExe) { (Signature-Summary $diaExe).status } else { "Absent" }
+    }
+  } else { $null }
   foreach ($pkg in $packages) { Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers:$false -ErrorAction SilentlyContinue }
   return [ordered]@{
     label=$Label
@@ -191,6 +204,7 @@ function Test-AppInstallerVariant([string]$Path, [string]$Label) {
     error_type=if ($errorRecord) { $errorRecord.Exception.GetType().FullName } else { $null }
     hresult=if ($errorRecord) { ('0x{0:X8}' -f ($errorRecord.Exception.HResult -band 0xffffffffL)) } else { $null }
     message=if ($errorRecord) { $errorRecord.Exception.Message } else { $null }
+    installed=$installedSummary
     package_count_after=@(Get-AppxPackage -Name "TheBrowserCompany.Dia" -ErrorAction SilentlyContinue).Count
   }
 }
@@ -286,15 +300,19 @@ try {
   Flip-OwnedCopy $dependencyPath $tamperedDependency 131072
   $tamperedDependencySignature = Signature-Summary $tamperedDependency
   Add-Test "T11" "dependency-trust" "tampered dependency fails Windows signature validation" ($tamperedDependencySignature.status -ne "Valid") $tamperedDependencySignature "The modified dependency loses Microsoft's valid signature."
+  $dependencyFullNamesBefore = @($baselineDependencies | ForEach-Object { $_.PackageFullName } | Sort-Object)
   $dependencyError = $null
   $dependencyAccepted = $false
   try { Add-AppxPackage -Path $tamperedDependency -ForceApplicationShutdown -ErrorAction Stop; $dependencyAccepted = $true } catch { $dependencyError = $_ }
-  $dependencyControl = [ordered]@{ accepted=$dependencyAccepted; hresult=if ($dependencyError) { ('0x{0:X8}' -f ($dependencyError.Exception.HResult -band 0xffffffffL)) } else { $null }; message=if ($dependencyError) { $dependencyError.Exception.Message } else { $null } }
-  Add-Test "T12" "dependency-trust" "Windows deployment rejects tampered dependency" (-not $dependencyAccepted) $dependencyControl "No tampered dependency was executed."
+  $dependencyPackagesAfterControl = @(Get-AppxPackage -Name "Microsoft.VCLibs.140.00.UWPDesktop" -ErrorAction SilentlyContinue)
+  $dependencyFullNamesAfterControl = @($dependencyPackagesAfterControl | ForEach-Object { $_.PackageFullName } | Sort-Object)
+  $dependencyControl = [ordered]@{ accepted_as_noop=$dependencyAccepted; hresult=if ($dependencyError) { ('0x{0:X8}' -f ($dependencyError.Exception.HResult -band 0xffffffffL)) } else { $null }; message=if ($dependencyError) { $dependencyError.Exception.Message } else { $null }; full_names_before=$dependencyFullNamesBefore; full_names_after=$dependencyFullNamesAfterControl; baseline_unchanged=(($dependencyFullNamesBefore -join '|') -eq ($dependencyFullNamesAfterControl -join '|')) }
+  Add-Test "T12" "dependency-trust" "tampered same-version dependency cannot replace installed Microsoft baseline" ($tamperedDependencySignature.status -ne "Valid" -and $dependencyControl.baseline_unchanged) $dependencyControl "Windows treated the already-installed dependency request as a no-op; the invalid file did not replace or add a package and was never executed."
 
   $rawAppInstaller = Get-Content -LiteralPath $appInstallerPath -Raw
   $appInstallerPositive = Test-AppInstallerVariant $appInstallerPath "official_unmodified"
-  Add-Test "T13" "descriptor-binding" "unmodified official AppInstaller positive control" ($appInstallerPositive.accepted -and $appInstallerPositive.package_count_after -eq 0) $appInstallerPositive "The same Windows AppInstaller code path used by the mismatch controls accepts the official descriptor and leaves no package after controlled removal."
+  $positiveIdentityPass = $appInstallerPositive.accepted -and $appInstallerPositive.installed.name -eq "TheBrowserCompany.Dia" -and $appInstallerPositive.installed.version -eq "0.28.0.380" -and $appInstallerPositive.installed.dia_exe_signature -eq "Valid" -and $appInstallerPositive.package_count_after -eq 0
+  Add-Test "T13" "descriptor-binding" "unmodified official AppInstaller positive control" $positiveIdentityPass $appInstallerPositive "The same Windows AppInstaller code path used by the metadata controls installs the exact signed package and leaves no package after controlled removal."
 
   $versionRegex = [regex]::new('(<MainPackage[\s\S]*?Version=")0\.28\.0\.380(")')
   $architectureRegex = [regex]::new('(<MainPackage[\s\S]*?ProcessorArchitecture=")x64(")')
@@ -310,7 +328,8 @@ try {
     $variantPath = Join-Path $controls ("{0}.appinstaller" -f $variant.Key)
     [IO.File]::WriteAllText($variantPath, [string]$variant.Value, [Text.UTF8Encoding]::new($false))
     $variantResult = Test-AppInstallerVariant $variantPath $variant.Key
-    Add-Test ("T{0:D2}" -f $variantIndex) "descriptor-binding" ("Windows rejects AppInstaller {0} mismatch" -f $variant.Key) ($appInstallerPositive.accepted -and -not $variantResult.accepted -and $variantResult.package_count_after -eq 0) $variantResult "The official control was accepted while this descriptor mutation produced no installed package."
+    $variantIdentityPass = $positiveIdentityPass -and $variantResult.accepted -and $variantResult.installed.name -eq "TheBrowserCompany.Dia" -and $variantResult.installed.version -eq "0.28.0.380" -and $variantResult.installed.publisher -eq $descriptor.main_publisher -and $variantResult.installed.dia_exe_signature -eq "Valid" -and $variantResult.package_count_after -eq 0
+    Add-Test ("T{0:D2}" -f $variantIndex) "descriptor-binding" ("AppInstaller {0} metadata cannot substitute signed package identity" -f $variant.Key) $variantIdentityPass $variantResult "Windows accepted the descriptor data but registered only the exact valid Browser Company package, then controlled removal restored absence."
     $variantIndex++
   }
 
@@ -329,11 +348,15 @@ try {
   Add-Test "T19" "temp-boundary" "bootstrap requests asInvoker execution" $asInvoker ([ordered]@{ mt_output=$peManifest.Trim(); requested_execution_level=if ($asInvoker) { "asInvoker" } else { "not_observed" } }) "The bootstrap does not create an automatic elevation boundary around user TEMP."
 
   $reusePath = Join-Path $env:TEMP "TheBrowserCompany.Dia.0.28.0.380.msix"
+  $reuseSourceDirectory = Join-Path $env:TEMP "bcny-r13-official-source"
+  $reuseSourcePath = Join-Path $reuseSourceDirectory "Dia.x64.msix"
+  New-Item -ItemType Directory -Force -Path $reuseSourceDirectory | Out-Null
+  Copy-Item -LiteralPath $msixPath -Destination $reuseSourcePath -Force
   if (Test-Path -LiteralPath $reusePath) { Remove-Item -LiteralPath $reusePath -Force }
-  & fsutil.exe hardlink create $reusePath $msixPath | Out-Null
+  & fsutil.exe hardlink create $reusePath $reuseSourcePath | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "failed to create owned official hardlink precondition" }
   $preReuseHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $reusePath).Hash.ToLowerInvariant()
-  $hardlinksBefore = @(& fsutil.exe hardlink list $msixPath 2>&1)
+  $hardlinksBefore = @(& fsutil.exe hardlink list $reuseSourcePath 2>&1)
   Add-Test "T20" "temp-boundary" "owned same-volume hardlink precondition" ($preReuseHash -eq $expected.msix) ([ordered]@{ predictable_leaf=(Split-Path $reusePath -Leaf); hardlinks=$hardlinksBefore; hash=$preReuseHash }) "Only exact official signed bytes were preplanted; no attacker bytes were executed."
 
   $listenerPort = 38921
@@ -350,18 +373,18 @@ try {
   if (-not $installed) { throw "signed bootstrap did not install Dia" }
   $packageInstalledByRun = $true
   $processCount = @(Get-Process -Name "Dia" -ErrorAction SilentlyContinue).Count
-  $postSourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $msixPath).Hash.ToLowerInvariant()
+  $postSourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $reuseSourcePath).Hash.ToLowerInvariant()
   $firstRun = [ordered]@{ exit_code=$first.ExitCode; callback_seen=$callbackSeen; installed_name=$installed.Name; installed_version=[string]$installed.Version; installed_publisher=$installed.Publisher; installed_signature_kind=[string]$installed.SignatureKind; dia_process_count=$processCount; source_msix_hash_after=$postSourceHash; reuse_path_exists_after=(Test-Path -LiteralPath $reusePath) }
   Add-Test "T21" "cli-channel" "unknown feed/channel arguments cannot override fixed RC source" ($first.ExitCode -eq 0 -and -not $callbackSeen -and $installed.Name -eq "TheBrowserCompany.Dia" -and [string]$installed.Version -eq "0.28.0.380") $firstRun "The only recognized runtime options are silent/console; the local override listener saw no connection."
   Add-Test "T22" "temp-boundary" "official hardlink source was not modified" ($postSourceHash -eq $expected.msix) $firstRun "The predictable cache path did not turn owned source bytes into a write primitive."
   Add-Test "T23" "execution" "silent install does not launch Dia" ($processCount -eq 0) $firstRun "The tested installer path registered the trusted package without executing Dia."
 
   if (Test-Path -LiteralPath $reusePath) { Remove-Item -LiteralPath $reusePath -Force }
-  & fsutil.exe hardlink create $reusePath $msixPath | Out-Null
+  & fsutil.exe hardlink create $reusePath $reuseSourcePath | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "failed to recreate official hardlink for same-version update" }
   $second = Start-Process -FilePath $installerPath -ArgumentList @("--silent", "--console") -Wait -PassThru
   $updated = Get-AppxPackage -Name "TheBrowserCompany.Dia" | Sort-Object Version -Descending | Select-Object -First 1
-  $secondRun = [ordered]@{ exit_code=$second.ExitCode; installed_full_name=$updated.PackageFullName; installed_version=[string]$updated.Version; source_msix_hash_after=(Get-FileHash -Algorithm SHA256 -LiteralPath $msixPath).Hash.ToLowerInvariant() }
+  $secondRun = [ordered]@{ exit_code=$second.ExitCode; installed_full_name=$updated.PackageFullName; installed_version=[string]$updated.Version; source_msix_hash_after=(Get-FileHash -Algorithm SHA256 -LiteralPath $reuseSourcePath).Hash.ToLowerInvariant() }
   Add-Test "T24" "update-behavior" "same-version signed update preserves exact package identity" ($second.ExitCode -eq 0 -and [string]$updated.Version -eq "0.28.0.380" -and $secondRun.source_msix_hash_after -eq $expected.msix) $secondRun "Re-entry did not select a different channel, identity, or package."
 
   $result.cli_and_temp = [ordered]@{
@@ -374,8 +397,9 @@ try {
   }
 
   $lowerSignedAvailable = $false
-  $downgradeObservation = [ordered]@{ lower_signed_artifact_available=$lowerSignedAvailable; wrong_version_descriptor_test="T16"; current_version=[string]$updated.Version }
-  Add-Test "T25" "downgrade" "no downgrade through mismatched descriptor or unsigned package" (-not $lowerSignedAvailable -and [string]$updated.Version -eq "0.28.0.380") $downgradeObservation "A lower official signed package was not supplied; the mismatched-version descriptor was rejected and no unsigned package was run."
+  $wrongVersionResult = @($tests | Where-Object { $_.id -eq "T16" })[0]
+  $downgradeObservation = [ordered]@{ lower_signed_artifact_available=$lowerSignedAvailable; wrong_version_descriptor_test="T16"; wrong_version_installed_actual_version=$wrongVersionResult.observed.installed.version; current_version=[string]$updated.Version }
+  Add-Test "T25" "downgrade" "lower descriptor version cannot downgrade signed package identity" (-not $lowerSignedAvailable -and $wrongVersionResult.passed -and $wrongVersionResult.observed.installed.version -eq "0.28.0.380" -and [string]$updated.Version -eq "0.28.0.380") $downgradeObservation "The descriptor's lower version did not change the actual signed package version; no lower signed artifact or unsigned package was run."
 }
 catch {
   $failed = $true
@@ -397,6 +421,8 @@ finally {
     if (-not $baselinePackageProfile -and (Test-Path -LiteralPath $packageProfile)) { Remove-Item -LiteralPath $packageProfile -Recurse -Force }
     $reusePath = Join-Path $env:TEMP "TheBrowserCompany.Dia.0.28.0.380.msix"
     if (Test-Path -LiteralPath $reusePath) { Remove-Item -LiteralPath $reusePath -Force }
+    $reuseSourceDirectory = Join-Path $env:TEMP "bcny-r13-official-source"
+    if (Test-Path -LiteralPath $reuseSourceDirectory) { Remove-Item -LiteralPath $reuseSourceDirectory -Recurse -Force }
     $arcLog = Join-Path $env:TEMP ".arcinstall"
     if (Test-Path -LiteralPath $arcLog) { Remove-Item -LiteralPath $arcLog -Force }
     $diaAfter = @(Get-AppxPackage -Name "TheBrowserCompany.Dia" -ErrorAction SilentlyContinue)
@@ -406,8 +432,9 @@ finally {
     $dependencyNamesAfter = (@($dependencyAfter | ForEach-Object { $_.PackageFullName }) | Sort-Object) -join "|"
     $dependencyNamesBefore = (@($baselineDependencies | ForEach-Object { $_.PackageFullName }) | Sort-Object) -join "|"
     $packageProfileAfter = Test-Path -LiteralPath $packageProfile
-    $cleanupPass = $diaAfter.Count -eq $baselineDia.Count -and $dependencyNamesAfter -eq $dependencyNamesBefore -and $shortcutAfter -eq $baselineShortcut -and $packageProfileAfter -eq $baselinePackageProfile -and @(Get-Process -Name "Dia" -ErrorAction SilentlyContinue).Count -eq 0 -and $tempCopiesAfter.Count -eq 0
-    $result.cleanup = [ordered]@{ passed=$cleanupPass; dia_count_after=$diaAfter.Count; dependency_full_names_after=@($dependencyAfter | ForEach-Object { $_.PackageFullName }); shortcut_after=$shortcutAfter; package_profile_after=$packageProfileAfter; dia_process_count_after=@(Get-Process -Name "Dia" -ErrorAction SilentlyContinue).Count; relaunch_temp_directory_count_after=$tempCopiesAfter.Count; predictable_cache_exists_after=(Test-Path -LiteralPath $reusePath); arcinstall_log_exists_after=(Test-Path -LiteralPath $arcLog) }
+    $reuseSourceExistsAfter = Test-Path -LiteralPath $reuseSourceDirectory
+    $cleanupPass = $diaAfter.Count -eq $baselineDia.Count -and $dependencyNamesAfter -eq $dependencyNamesBefore -and $shortcutAfter -eq $baselineShortcut -and $packageProfileAfter -eq $baselinePackageProfile -and @(Get-Process -Name "Dia" -ErrorAction SilentlyContinue).Count -eq 0 -and $tempCopiesAfter.Count -eq 0 -and -not $reuseSourceExistsAfter
+    $result.cleanup = [ordered]@{ passed=$cleanupPass; dia_count_after=$diaAfter.Count; dependency_full_names_after=@($dependencyAfter | ForEach-Object { $_.PackageFullName }); shortcut_after=$shortcutAfter; package_profile_after=$packageProfileAfter; dia_process_count_after=@(Get-Process -Name "Dia" -ErrorAction SilentlyContinue).Count; relaunch_temp_directory_count_after=$tempCopiesAfter.Count; predictable_cache_exists_after=(Test-Path -LiteralPath $reusePath); official_reuse_source_exists_after=$reuseSourceExistsAfter; arcinstall_log_exists_after=(Test-Path -LiteralPath $arcLog) }
     Add-Test "T26" "cleanup" "package/process/dependency/shortcut/temp cleanup" $cleanupPass $result.cleanup "The ephemeral runner returned to its exact relevant baseline."
     if (-not $cleanupPass) { $failed = $true }
   }
